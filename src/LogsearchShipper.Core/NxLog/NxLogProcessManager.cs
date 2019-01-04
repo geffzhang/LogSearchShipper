@@ -757,7 +757,7 @@ rM8ETzoKmuLdiTl3uUhgJMtdOP8w7geYl8o1YP+3YQ==
 	Exec rename_field('Severity', 'level');
 	Exec $timestamp = strftime($EventTime, '%Y-%m-%dT%H:%M:%S' + '{0}'); delete($EventTime);
 
-	Exec if string($Message) =~ /^failed to open/ $Category = 'MISSING_FILE';
+	Exec if string($Message) =~ /^failed to open/ drop();
 	Exec if string($Message) =~ /^input file does not exist:/ $Category = 'MISSING_FILE';
 	Exec if string($Message) =~ /^apr_stat failed on file/ $Category = 'MISSING_FILE';
 	Exec rename_field('Message', 'nxlog_message');
