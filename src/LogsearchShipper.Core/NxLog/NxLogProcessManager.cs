@@ -39,43 +39,50 @@ namespace LogSearchShipper.Core.NxLog
 	{
 		private static readonly ILog _log = LogManager.GetLogger(typeof(NxLogProcessManager));
 		private readonly string _dataFolder;
-		private readonly TimeSpan _waitForNxLogProcessToExitBeforeKilling = TimeSpan.FromSeconds(1);
 		private string _nxBinFolder;
 		private string _nxLogFile;
 		private string _maxNxLogFileSize = "1M";
 		private string _rotateNxLogFileEvery = "1 min";
-		private string _serviceName;
+		private readonly string _serviceName;
 
-		private string _userName;
-		private string _password;
+		private readonly string _userName;
+		private readonly string _password;
 
 		private readonly object _sync = new object();
 		private double _lastProcessorSecondsUsed;
 		private double _lastNxlogProcessorSecondsUsed;
-		private DateTime _lastProcessorUsageSentTime;
-		private Thread _processorUsageReportingThread;
+		private DateTime _lastProcessorUsageSentTime;		
+	    private System.Timers.Timer _processorUsageReportingTimer;
 
-		public NxLogProcessManager(string dataFolder, string userName = null, string password = null)
+		public NxLogProcessManager(string dataFolder, string serviceNamePrefix, string userName = null, string password = null)
 		{
 			_dataFolder = Path.GetFullPath(dataFolder);
 			InputFiles = new List<FileWatchElement>();
+			WinEventLogs = new List<WinEventWatchElement>();
 
 			var configId = Path.GetFullPath(dataFolder);
 			var hash = MD5.Create().ComputeHash(Encoding.ASCII.GetBytes(configId));
 			configId = BitConverter.ToString(hash).Replace("-", "");
+
 			_serviceName = "nxlog_" + configId;
+			if (!string.IsNullOrEmpty(serviceNamePrefix))
+				_serviceName = serviceNamePrefix + "_" + _serviceName;
+			// limit max service name length.
+			// See https://social.msdn.microsoft.com/Forums/vstudio/en-US/2c42c776-5e8b-4534-b11e-afaecabb3427/size-limitation-on-service-name-in-servicecontroller?forum=netfxbcl
+			if (_serviceName.Length > 80)
+				_serviceName = _serviceName.Substring(0, 80);
 
 			_userName = userName;
 			_password = password;
-		}
 
-		public NxLogProcessManager()
-			: this(Path.Combine(Path.GetTempPath(), "nxlog-data-" + Guid.NewGuid().ToString("N")), null, null)
-		{
+			ConfigFile = Path.Combine(DataFolder, "nxlog.conf");
+
+			InitTimeZoneOffset();
 		}
 
 		public SyslogEndpoint InputSyslog { get; set; }
 		public List<FileWatchElement> InputFiles { get; set; }
+		public List<WinEventWatchElement> WinEventLogs { get; set; }
 
 		public SyslogEndpoint OutputSyslog { get; set; }
 		public string OutputFile { get; set; }
@@ -106,42 +113,68 @@ namespace LogSearchShipper.Core.NxLog
 		{
 			get
 			{
-				if (!Directory.Exists(_dataFolder)) Directory.CreateDirectory(_dataFolder);
+				if (!Directory.Exists(_dataFolder))
+					Directory.CreateDirectory(_dataFolder);
 				return _dataFolder;
 			}
 		}
 
 		public string Config { get; private set; }
 
-		public int Start()
+		public void RegisterNxlogService()
 		{
-			if (_disposed)
-				throw new ObjectDisposedException(GetType().Name);
-			_stopped = false;
+			_log.Info("NxLogProcessManager.RegisterNxlogService");
+
+			VerifyNotDisposed();
 
 			_curSessionId = SessionId == "*"
 				? Guid.NewGuid().ToString()
 				: SessionId;
 
+			ServiceControllerEx.StopService(_serviceName);
+			ServiceControllerEx.DeleteService(_serviceName);
+
 			ExtractNXLog();
+
+			var executablePath = Path.Combine(BinFolder, "nxlog.exe");
+			var serviceArguments = string.Format("\"{0}\" -c \"{1}\"", executablePath, ConfigFile);
+			_log.InfoFormat("Running {0} as a service", serviceArguments);
+
+			_log.InfoFormat("Truncating {0}", NxLogFile);
+			if (File.Exists(NxLogFile))
+				File.WriteAllText(NxLogFile, string.Empty);
+
+			ServiceControllerEx.CreateService(_serviceName, serviceArguments, _userName, _password);
+		}
+
+		public void UnregisterNxlogService()
+		{
+			try
+			{
+				ServiceControllerEx.DeleteService(_serviceName);
+			}
+			catch (Exception exc)
+			{
+				_log.Error(exc);
+			}
+		}
+
+		public int Start()
+		{
+			VerifyNotDisposed();
+
+			_stopped = false;
+
 			SetupConfigFile();
 			StartNxLogProcess();
 
 			return NxLogProcess.Id;
 		}
 
-		public void StartNxLogProcess()
+		void StartNxLogProcess()
 		{
 			_log.Info("NxLogProcessManager.StartNxLogProcess");
 
-			string executablePath = Path.Combine(BinFolder, "nxlog.exe");
-			string serviceArguments = string.Format("\"{0}\" -c \"{1}\"", executablePath, ConfigFile);
-			_log.InfoFormat("Running {0} as a service", serviceArguments);
-
-			_log.InfoFormat("Truncating {0}", NxLogFile);
-			if (File.Exists(NxLogFile)) File.WriteAllText(NxLogFile, string.Empty);
-
-			ServiceControllerEx.CreateService(_serviceName, serviceArguments, _userName, _password);
 			ServiceControllerEx.StartService(_serviceName);
 
 			lock (_sync)
@@ -150,46 +183,35 @@ namespace LogSearchShipper.Core.NxLog
 				_lastProcessorSecondsUsed = 0;
 				_lastNxlogProcessorSecondsUsed = 0;
 
-				_processorUsageReportingThread = new Thread(ReportProcessorTimeUsage);
-				_processorUsageReportingThread.Start();
+                _processorUsageReportingTimer = new System.Timers.Timer
+                {
+                    AutoReset = false,
+                    Interval = ProcessorUsageReportingIntervalSeconds*1000
+                };
+                _processorUsageReportingTimer.Elapsed += _processorUsageReportingTimer_Elapsed;
+				_processorUsageReportingTimer.Start();
 			}
 		}
 
-		void ReportProcessorTimeUsage()
-		{
-			_log.Info("ReportProcessorTimeUsage() started");
-			try
-			{
-				while (!_disposed && !_stopped)
-				{
-					try
-					{
-						lock (_sync)
-						{
-							ReportCpuUsage(Process.GetCurrentProcess(), "ProcessorUsage",
-								ref _lastProcessorSecondsUsed, _lastProcessorUsageSentTime);
-							ReportCpuUsage(NxLogProcess, "NxlogProcessorUsage",
-								ref _lastNxlogProcessorSecondsUsed, _lastProcessorUsageSentTime);
+        private void _processorUsageReportingTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            try
+            {
+                lock (_sync)
+                {
+                    ReportCpuUsage(Process.GetCurrentProcess(), "ProcessorUsage",
+                        ref _lastProcessorSecondsUsed, _lastProcessorUsageSentTime);
+                    ReportCpuUsage(NxLogProcess, "NxlogProcessorUsage",
+                        ref _lastNxlogProcessorSecondsUsed, _lastProcessorUsageSentTime);
 
-							_lastProcessorUsageSentTime = DateTime.UtcNow;
-						}
-					}
-					catch (ThreadInterruptedException)
-					{
-						break;
-					}
-					catch (Exception exc)
-					{
-						_log.Error(exc.ToString());
-					}
-
-					Thread.Sleep(TimeSpan.FromSeconds(ProcessorUsageReportingIntervalSeconds));
-				}
-			}
-			catch (ThreadInterruptedException)
-			{
-			}
-			_log.Info("ReportProcessorTimeUsage() finished");
+                    _lastProcessorUsageSentTime = DateTime.UtcNow;
+                }
+            }            
+            catch (Exception exception)
+            {
+                _log.Error(exception);
+            }
+            _processorUsageReportingTimer.Start();
 		}
 
 		private static void ReportCpuUsage(Process process, string name, ref double lastProcessorSecondsUsed, DateTime lastSentTime)
@@ -215,8 +237,14 @@ namespace LogSearchShipper.Core.NxLog
 			GC.SuppressFinalize(this);
 		}
 
-		private volatile bool _disposed = false;
-		private volatile bool _stopped = false;
+		void VerifyNotDisposed()
+		{
+			if (_disposed)
+				throw new ObjectDisposedException(GetType().Name);
+		}
+
+		private volatile bool _disposed;
+		private volatile bool _stopped;
 
 		protected virtual void Dispose(bool disposing)
 		{
@@ -226,6 +254,7 @@ namespace LogSearchShipper.Core.NxLog
 				if (disposing)
 				{
 					Stop();
+					UnregisterNxlogService();
 				}
 
 				_disposed = true;
@@ -244,19 +273,17 @@ namespace LogSearchShipper.Core.NxLog
 			_stopped = true;
 			lock (_sync)
 			{
-				if (_processorUsageReportingThread != null)
+				if (_processorUsageReportingTimer != null)
 				{
-					_processorUsageReportingThread.Interrupt();
-					if (!_processorUsageReportingThread.Join(TimeSpan.FromSeconds(5)))
-						_processorUsageReportingThread.Abort();
-					_processorUsageReportingThread = null;
+				    _processorUsageReportingTimer.Elapsed -= _processorUsageReportingTimer_Elapsed;
+					_processorUsageReportingTimer.Stop();
 				}
 			}
 
 			_log.Info("Trying to close nxlog service gracefully");
 			try
 			{
-				ServiceControllerEx.DeleteService(_serviceName);
+				ServiceControllerEx.StopService(_serviceName);
 			}
 			catch (Exception exc)
 			{
@@ -321,13 +348,13 @@ LogLevel	{0}
 LogFile		{1}
 
 <Extension fileop>
-		Module		xm_fileop
+	Module xm_fileop
 
-		# Check the size of our log file every {2}, rotate if larger than {3}, keeping a maximum of 1 files
-		<Schedule>
-			 Every	{2}
-			 Exec		if (file_size('{1}') >= {3}) file_cycle('{1}', 1);
-		</Schedule>
+	# Check the size of our log file every {2}, rotate if larger than {3}, keeping a maximum of 1 files
+	<Schedule>
+		Every {2}
+		Exec if (file_size('{1}') >= {3}) file_cycle('{1}', 1);
+	</Schedule>
 </Extension>
 
 <Extension json>
@@ -344,15 +371,15 @@ SpoolDir	{6}
 </Extension>
 
 <Extension multiline_default>
-		Module	xm_multiline
-		#HeaderLine == Anything not starting with whitespace
-		HeaderLine	/^([^ ]+).*/
+	Module	xm_multiline
+	#HeaderLine == Anything not starting with whitespace
+	HeaderLine	/^([^ ]+).*/
 </Extension>
 
 <Extension multiline_ci_log4net>
-		Module	xm_multiline
-		#HeaderLine == Any line starting with text (WARN, ERROR) and YYYY-
-		HeaderLine	/^[A-Z]+[ \t]+\d{{4}}-.*/
+	Module	xm_multiline
+	#HeaderLine == Any line starting with text (WARN, ERROR) and YYYY-
+	HeaderLine	/^[A-Z]+[ \t]+\d{{4}}-.*/
 </Extension>
 
 {7}
@@ -361,6 +388,7 @@ SpoolDir	{6}
 {10}
 {11}
 {12}
+{13}
 ",
 				_log.IsDebugEnabled ? "DEBUG" : "INFO",
 				NxLogFile,
@@ -374,11 +402,11 @@ SpoolDir	{6}
 				GenerateInputSyslogConfig(),
 				GenerateInputFilesConfig(),
 				GenerateInternalLoggingConfig(),
+				GenerateWinEventWatchersConfig(),
 				GenerateRoutes()
 				);
 
 			Config = config;
-			ConfigFile = Path.Combine(DataFolder, "nxlog.conf");
 			File.WriteAllText(ConfigFile, config);
 			_log.InfoFormat("NXLog config file: {0}", ConfigFile);
 		}
@@ -434,7 +462,11 @@ SpoolDir	{6}
 			{
 				allInputs += "in_file" + i + ",";
 			}
-			allInputs = allInputs.TrimEnd(new[] { ',' });
+			for (int i = 0; i < WinEventLogs.Count; i++)
+			{
+				allInputs += "in_eventlog" + i + ",";
+			}
+			allInputs = allInputs.TrimEnd(',');
 
 			allInputs = "in_internal," + allInputs;
 
@@ -443,12 +475,12 @@ SpoolDir	{6}
 				routeSection += string.Format(@"
 # The buffer needed to NOT loose events when Logstash restarts
 <Processor buffer_out_syslog>
-    Module      pm_buffer
-    # 100Mb buffer
-    MaxSize 100000
-    Type Mem
-    # warn at 50Mb
-    WarnLimit 50000
+	Module pm_buffer
+	# 100Mb buffer
+	MaxSize 100000
+	Type Mem
+	# warn at 50Mb
+	WarnLimit 50000
 </Processor>
 <Route route_to_syslog>
 	Path {0} => buffer_out_syslog => out_syslog
@@ -529,12 +561,12 @@ rM8ETzoKmuLdiTl3uUhgJMtdOP8w7geYl8o1YP+3YQ==
 			_log.InfoFormat("Sending data to: syslog-tls://{0}:{1}", OutputSyslog.Host, OutputSyslog.Port);
 			return string.Format(@"
 <Output out_syslog>
-		Module	om_ssl
-		Host	{0}
-		Port	{1}
-		AllowUntrusted TRUE
-		Exec	if $Message $Message=replace($Message,""\n"",""¬""); 
-		Exec	to_syslog_ietf();
+	Module	om_ssl
+	Host	{0}
+	Port	{1}
+	AllowUntrusted TRUE
+	Exec	if $Message $Message=replace($Message,""\n"",""¬"");
+	Exec	to_syslog_ietf();
 </Output>",
 				OutputSyslog.Host, OutputSyslog.Port);
 		}
@@ -668,17 +700,17 @@ rM8ETzoKmuLdiTl3uUhgJMtdOP8w7geYl8o1YP+3YQ==
 			return res;
 		}
 
-		private static string AppendCustomFields(FileWatchElement inputFile)
+		private static string AppendCustomFields(IWatchElement watchElement)
 		{
-			if (inputFile.Fields.Count == 0)
+			if (watchElement.Fields.Count == 0)
 				return "";
 			var buf = new StringBuilder();
-			foreach (FieldElement field in inputFile.Fields)
+			foreach (FieldElement field in watchElement.Fields)
 			{
-				if (!field.Key.All(Char.IsLetter))
+				if (!field.Key.All(ch => Char.IsLetterOrDigit(ch) || ch == '/' || ch == '_'))
 				{
-					var message = string.Format("fileWatch: '{0}' contains invalid field name '{1}' (must contain letters only)",
-						inputFile.Files, field.Key);
+					var message = string.Format("fileWatch: '{0}' contains invalid field name '{1}' (must contain letters, digits, slashes and underscores only)",
+						watchElement.Key, field.Key);
 					throw new ApplicationException(message);
 				}
 
@@ -716,37 +748,90 @@ rM8ETzoKmuLdiTl3uUhgJMtdOP8w7geYl8o1YP+3YQ==
 
 		private string GenerateInternalLoggingConfig()
 		{
-			// nxlog doesn't handle time zone correctly, so we need to set the correct time zone variable to be used in the nxlog config file
-			var timeZoneOffset = TimeZone.CurrentTimeZone.GetUtcOffset(DateTime.Now);
-			var timeZoneText = timeZoneOffset.ToString("hh\\:mm");
-			var sign = (timeZoneOffset >= TimeSpan.Zero) ? "+" : "-";
-			timeZoneText = sign + timeZoneText;
-
 			var res = string.Format(@"
 <Input in_internal>
-   Module im_internal
-   Exec $logger = 'nxlog.exe';
-   Exec delete($SourceModuleType); delete($SourceModuleName); delete($SeverityValue); delete($ProcessID);
-   Exec delete($SourceName); delete($EventReceivedTime); delete($Hostname);
-   Exec rename_field('Severity', 'level');
-   Exec $timestamp = strftime($EventTime, '%Y-%m-%dT%H:%M:%S' + '{0}'); delete($EventTime);
+	Module im_internal
+	Exec $logger = 'nxlog.exe';
+	Exec delete($SourceModuleType); delete($SourceModuleName); delete($SeverityValue); delete($ProcessID);
+	Exec delete($SourceName); delete($EventReceivedTime); delete($Hostname);
+	Exec rename_field('Severity', 'level');
+	Exec $timestamp = strftime($EventTime, '%Y-%m-%dT%H:%M:%S' + '{0}'); delete($EventTime);
 
-   Exec if string($Message) =~ /^failed to open/ $Category = 'MISSING_FILE';
-   Exec if string($Message) =~ /^input file does not exist:/ $Category = 'MISSING_FILE';
-   Exec if string($Message) =~ /^apr_stat failed on file/ $Category = 'MISSING_FILE';
-   Exec rename_field('Message', 'nxlog_message');
+	Exec if string($Message) =~ /^failed to open/ drop();
+	Exec if string($Message) =~ /^input file does not exist:/ $Category = 'MISSING_FILE';
+	Exec if string($Message) =~ /^apr_stat failed on file/ $Category = 'MISSING_FILE';
+	Exec rename_field('Message', 'nxlog_message');
 
-   Exec to_json();  $type = 'json';
+	Exec to_json(); $type = 'json';
 {1}
-</Input>", timeZoneText, GetSessionId());
+</Input>", _timeZoneText, GetSessionId());
 			return res;
+		}
+
+		private string GenerateWinEventWatchersConfig()
+		{
+			var res = new StringBuilder();
+
+			var i = 0;
+			foreach (var cur in WinEventLogs)
+			{
+				res.Append(GenerateWinEventWatcherConfig(cur, i));
+				i++;
+			}
+
+			return res.ToString();
+		}
+
+		private string GenerateWinEventWatcherConfig(WinEventWatchElement watcher, int i)
+		{
+			var res = string.Format(@"
+<Input in_eventlog{0}>
+	Module im_msvistalog
+	ReadFromLast {1}
+	Query <QueryList> \
+			<Query Id=""0"">\
+				<Select Path=""{2}"">{3}</Select>\
+			</Query>\
+		</QueryList>
+{4}
+", i, watcher.ReadFromLast.ToString().ToUpper(), watcher.Path, watcher.Query, GetSessionId());
+
+			res += AppendCustomFields(watcher);
+
+			// Limit maximum message size to just less than 1MB; or NXLog dies with: ERROR string limit (1048576 bytes) reached
+			res += @"	Exec if $Message $Message = substr($raw_event, 0, 1040000);" + Environment.NewLine;
+
+			res += string.Format(@"
+	Exec $logger = 'nxlog.exe';
+	Exec $service = 'WindowsEvents';
+	Exec delete($SeverityValue);
+	Exec rename_field('Severity', 'level');
+	Exec $timestamp = strftime($EventTime, '%Y-%m-%dT%H:%M:%S' + '{0}'); delete($EventTime);
+	Exec rename_field('Hostname', 'host');
+	Exec delete ($EventID); delete ($EventType); delete ($Keywords); delete ($Task); delete ($RecordNumber); delete ($ProcessID);
+	Exec delete ($ThreadID); delete ($Channel); delete ($EventReceivedTime);
+	Exec if $level == 'WARNING' $level = 'WARN';
+	Exec rename_field('Message', 'event_description');
+	Exec to_json(); $type = 'json';
+</Input>" + Environment.NewLine, _timeZoneText);
+
+			return res;
+		}
+
+		void InitTimeZoneOffset()
+		{
+			// nxlog doesn't handle time zone correctly, so we need to set the correct time zone variable to be used in the nxlog config file
+			var timeZoneOffset = TimeZone.CurrentTimeZone.GetUtcOffset(DateTime.Now);
+			_timeZoneText = timeZoneOffset.ToString("hh\\:mm");
+			var sign = (timeZoneOffset >= TimeSpan.Zero) ? "+" : "-";
+			_timeZoneText = sign + _timeZoneText;
 		}
 
 		string GetSessionId()
 		{
 			if (string.IsNullOrEmpty(_curSessionId))
 				return "";
-			var res = string.Format("   Exec $sessionId = '{0}';" + Environment.NewLine, _curSessionId);
+			var res = string.Format("	Exec $sessionId = '{0}';" + Environment.NewLine, _curSessionId);
 			return res;
 		}
 
@@ -821,5 +906,6 @@ rM8ETzoKmuLdiTl3uUhgJMtdOP8w7geYl8o1YP+3YQ==
 		}
 
 		private string _curSessionId;
+		private string _timeZoneText;
 	}
 }

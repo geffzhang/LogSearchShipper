@@ -48,7 +48,10 @@
     <Reference Include="System.Xml.Linq" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="ConfigurationSections\WinEventWatchCollection.cs" />
+    <Compile Include="ConfigurationSections\WinEventWatchElement.cs" />
     <Compile Include="ConfigurationSections\FileWatchElement.cs" />
+    <Compile Include="ConfigurationSections\IWatchElement.cs" />
     <Compile Include="ConfigurationSections\OverrideConfig.cs" />
     <Compile Include="ConfigWatcher.cs" />
     <Compile Include="CustomPatternLayoutConverter.cs" />
@@ -76,7 +79,7 @@
   <ItemGroup />
   <ItemGroup>
     <None Include="packages.config" />
-    <None Include="Resources\nxlog-ce-2.9.1347.zip" />
+    <None Include="Resources\nxlog_ce_2.9.1504.zip" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Resources\Resource.resx">

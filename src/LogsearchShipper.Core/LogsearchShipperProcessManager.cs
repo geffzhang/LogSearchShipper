@@ -5,14 +5,17 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
+
 using log4net;
 using LogSearchShipper.Core.ConfigurationSections;
 using LogSearchShipper.Core.NxLog;
 
 namespace LogSearchShipper.Core
 {
-	public class LogSearchShipperProcessManager
+	public class LogSearchShipperProcessManager : IDisposable
 	{
+		public string ServiceName;
+
 		private static readonly ILog _log = LogManager.GetLogger(typeof(LogSearchShipperProcessManager));
 
 		private readonly Dictionary<string, Timer> _environmentDiagramLoggingTimers = new Dictionary<string, Timer>();
@@ -31,15 +34,14 @@ namespace LogSearchShipper.Core
 			}
 		}
 
-		public int Start()
+		public void RegisterService()
 		{
-			_log.Info("LogSearchShipperProcessManager.Start");
+			_log.Info("LogSearchShipperProcessManager.RegisterService");
 
 			if (!Directory.Exists(LogSearchShipperConfig.DataFolder))
-			{
 				Directory.CreateDirectory(LogSearchShipperConfig.DataFolder);
-			}
-			NxLogProcessManager = new NxLogProcessManager(LogSearchShipperConfig.DataFolder,
+
+			NxLogProcessManager = new NxLogProcessManager(LogSearchShipperConfig.DataFolder, ServiceName,
 				LogSearchShipperConfig.ShipperServiceUsername, LogSearchShipperConfig.ShipperServicePassword)
 				{
 					SessionId = LogSearchShipperConfig.SessionId,
@@ -48,6 +50,13 @@ namespace LogSearchShipper.Core
 					OutputFile = LogSearchShipperConfig.OutputFile,
 					ResolveUncPaths = LogSearchShipperConfig.ResolveUncPaths,
 				};
+
+			NxLogProcessManager.RegisterNxlogService();
+		}
+
+		public int Start()
+		{
+			_log.Info("LogSearchShipperProcessManager.Start");
 
 			SetupInputFiles();
 			NxLogProcessManager.OutputSyslog = new SyslogEndpoint(LogSearchShipperConfig.IngestorHost,
@@ -77,10 +86,18 @@ namespace LogSearchShipper.Core
 
 				try
 				{
-					_log.Info("Updating config and restarting shipping...");
-					NxLogProcessManager.Stop();
+					_log.Info("Updating config...");
+
+					var oldConfig = NxLogProcessManager.Config;
 					SetupInputFiles();
-					NxLogProcessManager.Start();
+					NxLogProcessManager.SetupConfigFile();
+
+					if (NxLogProcessManager.Config != oldConfig)
+					{
+						_log.Info("Restarting shipping...");
+						NxLogProcessManager.Stop();
+						NxLogProcessManager.Start();
+					}
 				}
 				finally
 				{
@@ -119,6 +136,8 @@ namespace LogSearchShipper.Core
 			ExtractEDBFileWatchers(LogSearchShipperConfig, watches);
 
 			NxLogProcessManager.InputFiles = watches;
+			NxLogProcessManager.WinEventLogs = new List<WinEventWatchElement>(
+				LogSearchShipperConfig.WinEventWatchers.Cast<WinEventWatchElement>());
 		}
 
 		private void AddWatchedConfigFile(string filePath)
@@ -201,6 +220,15 @@ namespace LogSearchShipper.Core
 			catch (Exception exc)
 			{
 				_log.Error(exc);
+			}
+		}
+
+		public void Dispose()
+		{
+			if (NxLogProcessManager != null)
+			{
+				NxLogProcessManager.Dispose();
+				NxLogProcessManager = null;
 			}
 		}
 	}
